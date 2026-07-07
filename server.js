@@ -201,6 +201,8 @@ async function fetchYahoo(symbol, exchange) {
   return parseFloat(price);
 }
 
+// ── UNLISTED SHARES ENDPOINT ──
+// Usage: /unlisted-price?name=NSE
 app.get('/unlisted-price', async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -237,4 +239,9 @@ app.get('/unlisted-price', async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
+});
+
+// ── START SERVER ──
+app.listen(PORT, () => {
+  console.log(`✅ NSE Price Proxy running on port ${PORT}`);
 });
