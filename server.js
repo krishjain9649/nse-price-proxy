@@ -218,6 +218,29 @@ let unlistedCatalogBuiltAt = 0;
 const UNLISTED_CATALOG_TTL = 60 * 60 * 1000; // 1 hour
 let unlistedCatalogBuilding = null; // in-flight promise so concurrent requests share one crawl
 
+// Some sites silently block requests coming from cloud/datacenter IP ranges
+// (which is exactly what Render's servers are), even with normal browser
+// headers. If a direct fetch fails or comes back empty, retry the same URL
+// through allorigins.win's raw pass-through — the same CORS-proxy trick your
+// HTML frontend already uses for Stooq and Yahoo Finance elsewhere.
+async function fetchHtmlWithFallback(url, headers) {
+  try {
+    const r = await fetch(url, { headers, timeout: 10000 });
+    if (r.ok) {
+      const body = await r.text();
+      if (body && body.length > 200) return body;
+    }
+    console.warn(`Direct fetch of ${url} returned status ${r.status} / short body — trying allorigins fallback`);
+  } catch (e) {
+    console.warn(`Direct fetch of ${url} failed (${e.message}) — trying allorigins fallback`);
+  }
+
+  const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+  const r2 = await fetch(proxied, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 });
+  if (!r2.ok) throw new Error(`allorigins fallback HTTP ${r2.status}`);
+  return await r2.text();
+}
+
 async function buildUnlistedCatalog() {
   const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
   // Matches: <a href="https://unlistedzone.com/shares/{slug}">{Name}</a> ... <h5 class="card-title">₹{price}</h5>
@@ -233,9 +256,7 @@ async function buildUnlistedCatalog() {
 
     let html = '';
     try {
-      const r = await fetch(url, { headers, timeout: 10000 });
-      if (!r.ok) break;
-      const body = await r.text();
+      const body = await fetchHtmlWithFallback(url, headers);
       // Page 1 is a full HTML document. page>1 comes back as {"status":200,"html":"..."}
       try {
         const j = JSON.parse(body);
@@ -244,7 +265,8 @@ async function buildUnlistedCatalog() {
         html = body;
       }
     } catch (e) {
-      break; // network error mid-crawl — stop, keep whatever we already parsed
+      console.warn(`Unlisted catalog crawl stopped at page ${page}: ${e.message}`);
+      break; // both direct and fallback failed mid-crawl — stop, keep what we have
     }
 
     if (!html) break;
@@ -356,9 +378,12 @@ app.get('/unlisted-price', async (req, res) => {
 async function fetchUnlistedPriceByGuessedSlug(name) {
   const slug = name.toLowerCase().trim().replace(/\s+/g, '-') + '-unlisted-shares';
   const url = `https://unlistedzone.com/shares/${slug}`;
-  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
-  if (!r.ok) return null;
-  const html = await r.text();
+  let html;
+  try {
+    html = await fetchHtmlWithFallback(url, { 'User-Agent': 'Mozilla/5.0' });
+  } catch (e) {
+    return null;
+  }
   const stripped = html.replace(/<[^>]+>/g, ' ');
   const m = stripped.match(/₹\s?([\d,]+\.?\d*)\s*(?:Indicative)/i)
          || stripped.match(/(?:Indicative)[^₹]{0,40}₹\s?([\d,]+\.?\d*)/i);
