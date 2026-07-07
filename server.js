@@ -201,18 +201,39 @@ async function fetchYahoo(symbol, exchange) {
   return parseFloat(price);
 }
 
-app.listen(PORT, () => {
-  console.log(`✅ NSE Price Proxy running on port ${PORT}`);
-});
 app.get('/unlisted-price', async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
-    const url = `https://unlistedzone.com/shares/${name.toLowerCase().replace(/\s+/g,'-')}-unlisted-shares`;
+    const slug = name.toLowerCase().trim().replace(/\s+/g, '-') + '-unlisted-shares';
+    const url = `https://unlistedzone.com/shares/${slug}`;
     const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!r.ok) throw new Error(`page returned ${r.status}`);
     const html = await r.text();
-    // TODO: extract price from html — depends on what you found in Step 2
-    res.json({ price: null, note: 'selector not filled in yet' });
+
+    let price = null;
+
+    // Try 1: look for embedded JSON data (__NEXT_DATA__), search for a price-like field
+    const jsonMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (jsonMatch) {
+      try {
+        const data = JSON.parse(jsonMatch[1]);
+        const jsonStr = JSON.stringify(data);
+        const priceMatch = jsonStr.match(/"price"\s*:\s*"?([\d,]+\.?\d*)"?/i);
+        if (priceMatch) price = parseFloat(priceMatch[1].replace(/,/g, ''));
+      } catch (e) { /* fall through to Try 2 */ }
+    }
+
+    // Try 2: find a ₹ amount sitting near the word "Indicative" in the raw text
+    if (!price) {
+      const stripped = html.replace(/<[^>]+>/g, ' ');
+      const nearIndicative = stripped.match(/₹\s?([\d,]+\.?\d*)\s*(?:Indicative)/i)
+                            || stripped.match(/(?:Indicative)[^₹]{0,40}₹\s?([\d,]+\.?\d*)/i);
+      if (nearIndicative) price = parseFloat(nearIndicative[1].replace(/,/g, ''));
+    }
+
+    if (!price || price <= 0) throw new Error('could not locate a price on the page');
+    res.json({ price, source: 'unlistedzone' });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
