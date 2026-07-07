@@ -124,7 +124,7 @@ app.post('/prices', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// FETCHER FUNCTIONS
+// FETCHER FUNCTIONS (listed equities — unchanged)
 // ══════════════════════════════════════════
 
 async function fetchNSE(symbol) {
@@ -201,44 +201,181 @@ async function fetchYahoo(symbol, exchange) {
   return parseFloat(price);
 }
 
-// ── UNLISTED SHARES ENDPOINT ──
-// Usage: /unlisted-price?name=NSE
-app.get('/unlisted-price', async (req, res) => {
-  const { name } = req.query;
-  if (!name) return res.status(400).json({ error: 'name required' });
-  try {
-    const slug = name.toLowerCase().trim().replace(/\s+/g, '-') + '-unlisted-shares';
-    const url = `https://unlistedzone.com/shares/${slug}`;
-    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!r.ok) throw new Error(`page returned ${r.status}`);
-    const html = await r.text();
+// ══════════════════════════════════════════
+// UNLISTED SHARES — catalog-based search + price
+// ══════════════════════════════════════════
+// unlistedzone.com has no public search API, so instead of guessing a page
+// slug from whatever name the user typed (which breaks the moment the real
+// slug doesn't match the guess), we crawl their public /shares listing pages
+// once, cache every {name, slug, price} we find in memory, and search/lookup
+// against that cache. The listing itself already shows each company's current
+// indicative price, so this doubles as the price source too — no need to hit
+// each company's own page separately. Cache refreshes once an hour so we're
+// not hammering their site on every request.
 
-    let price = null;
+let unlistedCatalog = [];        // [{ name, slug, price }]
+let unlistedCatalogBuiltAt = 0;
+const UNLISTED_CATALOG_TTL = 60 * 60 * 1000; // 1 hour
+let unlistedCatalogBuilding = null; // in-flight promise so concurrent requests share one crawl
 
-    // Try 1: look for embedded JSON data (__NEXT_DATA__), search for a price-like field
-    const jsonMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (jsonMatch) {
+async function buildUnlistedCatalog() {
+  const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+  // Matches: <a href="https://unlistedzone.com/shares/{slug}">{Name}</a> ... <h5 class="card-title">₹{price}</h5>
+  const cardRegex = /<a\s+href="https:\/\/unlistedzone\.com\/shares\/([^"]+)">\s*([^<]+?)\s*<\/a>[\s\S]{0,120}?<h5 class="card-title">₹([\d,]+\.?\d*)<\/h5>/g;
+
+  const catalog = [];
+  const seenSlugs = new Set();
+
+  for (let page = 1; page <= 30; page++) {
+    const url = page === 1
+      ? 'https://unlistedzone.com/shares'
+      : `https://unlistedzone.com/shares?page=${page}`;
+
+    let html = '';
+    try {
+      const r = await fetch(url, { headers, timeout: 10000 });
+      if (!r.ok) break;
+      const body = await r.text();
+      // Page 1 is a full HTML document. page>1 comes back as {"status":200,"html":"..."}
       try {
-        const data = JSON.parse(jsonMatch[1]);
-        const jsonStr = JSON.stringify(data);
-        const priceMatch = jsonStr.match(/"price"\s*:\s*"?([\d,]+\.?\d*)"?/i);
-        if (priceMatch) price = parseFloat(priceMatch[1].replace(/,/g, ''));
-      } catch (e) { /* fall through to Try 2 */ }
+        const j = JSON.parse(body);
+        html = (j && j.html) ? j.html.replace(/\\\//g, '/').replace(/\\"/g, '"') : '';
+      } catch (e) {
+        html = body;
+      }
+    } catch (e) {
+      break; // network error mid-crawl — stop, keep whatever we already parsed
     }
 
-    // Try 2: find a ₹ amount sitting near the word "Indicative" in the raw text
-    if (!price) {
-      const stripped = html.replace(/<[^>]+>/g, ' ');
-      const nearIndicative = stripped.match(/₹\s?([\d,]+\.?\d*)\s*(?:Indicative)/i)
-                            || stripped.match(/(?:Indicative)[^₹]{0,40}₹\s?([\d,]+\.?\d*)/i);
-      if (nearIndicative) price = parseFloat(nearIndicative[1].replace(/,/g, ''));
+    if (!html) break;
+
+    let match;
+    let foundOnThisPage = 0;
+    cardRegex.lastIndex = 0;
+    while ((match = cardRegex.exec(html)) !== null) {
+      const slug = match[1];
+      if (seenSlugs.has(slug)) continue;
+      seenSlugs.add(slug);
+      // unlistedzone truncates long names on the listing page (e.g. "Apollo Fashion
+      // International Unlisted Sh ..."). Strip that trailing ellipsis so the dropdown
+      // shows a clean (if occasionally shortened) name rather than a garbled one.
+      const name = match[2].trim().replace(/\s*\.\.\.\s*$/, '');
+      const price = parseFloat(match[3].replace(/,/g, ''));
+      catalog.push({ name, slug, price: isNaN(price) ? null : price });
+      foundOnThisPage++;
     }
 
-    if (!price || price <= 0) throw new Error('could not locate a price on the page');
-    res.json({ price, source: 'unlistedzone' });
+    if (foundOnThisPage === 0) break; // reached the last page
+    await new Promise(r => setTimeout(r, 250)); // be polite between page requests
+  }
+
+  return catalog;
+}
+
+async function getUnlistedCatalog() {
+  const isStale = Date.now() - unlistedCatalogBuiltAt > UNLISTED_CATALOG_TTL;
+  if (unlistedCatalog.length && !isStale) return unlistedCatalog;
+
+  if (!unlistedCatalogBuilding) {
+    unlistedCatalogBuilding = buildUnlistedCatalog()
+      .then(catalog => {
+        if (catalog.length) {
+          unlistedCatalog = catalog;
+          unlistedCatalogBuiltAt = Date.now();
+        }
+        unlistedCatalogBuilding = null;
+        return unlistedCatalog;
+      })
+      .catch(e => {
+        unlistedCatalogBuilding = null;
+        console.warn('Unlisted catalog build failed:', e.message);
+        return unlistedCatalog; // whatever we had before (possibly stale, possibly empty)
+      });
+  }
+  return unlistedCatalogBuilding;
+}
+
+// ── /unlisted-search?q=... — THIS ROUTE WAS MISSING BEFORE. The frontend has
+// been calling it all along; there was simply nothing here to answer it. ──
+app.get('/unlisted-search', async (req, res) => {
+  const q = (req.query.q || '').trim().toLowerCase();
+  if (!q) return res.json([]);
+  try {
+    const catalog = await getUnlistedCatalog();
+    const results = catalog
+      .filter(c => c.name.toLowerCase().includes(q))
+      .slice(0, 15)
+      .map(c => ({ name: c.name, slug: c.slug }));
+    res.json(results);
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
+});
+
+// ── /unlisted-price?name=...&slug=... ──
+// Previously this ignored the `slug` param entirely and always re-guessed a
+// URL from the name. Now it checks the crawled catalog first (by slug, then
+// by name), and only falls back to guessing a URL for a brand-new company
+// that hasn't been picked up by a crawl yet.
+app.get('/unlisted-price', async (req, res) => {
+  const { name, slug } = req.query;
+  if (!name && !slug) return res.status(400).json({ error: 'name or slug required' });
+
+  try {
+    const catalog = await getUnlistedCatalog();
+
+    if (slug) {
+      const bySlug = catalog.find(c => c.slug === slug);
+      if (bySlug && bySlug.price != null) {
+        return res.json({ price: bySlug.price, source: 'unlistedzone-catalog', slug: bySlug.slug });
+      }
+    }
+
+    if (name) {
+      const n = name.trim().toLowerCase();
+      const byName = catalog.find(c => c.name.trim().toLowerCase() === n)
+                  || catalog.find(c => c.name.trim().toLowerCase().startsWith(n));
+      if (byName && byName.price != null) {
+        return res.json({ price: byName.price, source: 'unlistedzone-catalog', slug: byName.slug });
+      }
+    }
+
+    // Last resort: guess the slug from the name and scrape that page directly
+    // (covers a company added to unlistedzone.com since the last hourly crawl)
+    if (name) {
+      const guessed = await fetchUnlistedPriceByGuessedSlug(name);
+      if (guessed) return res.json({ price: guessed, source: 'unlistedzone-guess' });
+    }
+
+    return res.status(404).json({ error: `Could not find a price for "${name || slug}" on unlistedzone.com` });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+async function fetchUnlistedPriceByGuessedSlug(name) {
+  const slug = name.toLowerCase().trim().replace(/\s+/g, '-') + '-unlisted-shares';
+  const url = `https://unlistedzone.com/shares/${slug}`;
+  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
+  if (!r.ok) return null;
+  const html = await r.text();
+  const stripped = html.replace(/<[^>]+>/g, ' ');
+  const m = stripped.match(/₹\s?([\d,]+\.?\d*)\s*(?:Indicative)/i)
+         || stripped.match(/(?:Indicative)[^₹]{0,40}₹\s?([\d,]+\.?\d*)/i);
+  if (!m) return null;
+  const price = parseFloat(m[1].replace(/,/g, ''));
+  return (!price || price <= 0) ? null : price;
+}
+
+// ── Debug helper: check catalog health from a browser ──
+// Visit https://your-proxy.onrender.com/unlisted-catalog-status
+app.get('/unlisted-catalog-status', (req, res) => {
+  res.json({
+    companies: unlistedCatalog.length,
+    builtAt: unlistedCatalogBuiltAt ? new Date(unlistedCatalogBuiltAt).toISOString() : null,
+    stale: !unlistedCatalogBuiltAt || (Date.now() - unlistedCatalogBuiltAt > UNLISTED_CATALOG_TTL),
+    sample: unlistedCatalog.slice(0, 5)
+  });
 });
 
 // ── START SERVER ──
