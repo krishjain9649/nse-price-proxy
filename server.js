@@ -369,7 +369,16 @@ async function fetchUnlistedPriceByGuessedSlug(name) {
 
 // ── Debug helper: check catalog health from a browser ──
 // Visit https://your-proxy.onrender.com/unlisted-catalog-status
-app.get('/unlisted-catalog-status', (req, res) => {
+// Unlike a plain status read, this ACTIVELY triggers a crawl if none has run yet
+// (or if the cache is stale), so a first visit right after deploy will actually
+// build the catalog instead of just reporting that nothing has happened.
+app.get('/unlisted-catalog-status', async (req, res) => {
+  try {
+    await getUnlistedCatalog();
+  } catch (e) {
+    // getUnlistedCatalog already swallows crawl errors internally and returns
+    // whatever it has, so this catch is just a safety net.
+  }
   res.json({
     companies: unlistedCatalog.length,
     builtAt: unlistedCatalogBuiltAt ? new Date(unlistedCatalogBuiltAt).toISOString() : null,
