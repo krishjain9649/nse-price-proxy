@@ -204,3 +204,16 @@ async function fetchYahoo(symbol, exchange) {
 app.listen(PORT, () => {
   console.log(`✅ NSE Price Proxy running on port ${PORT}`);
 });
+app.get('/unlisted-price', async (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const url = `https://unlistedzone.com/shares/${name.toLowerCase().replace(/\s+/g,'-')}-unlisted-shares`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const html = await r.text();
+    // TODO: extract price from html — depends on what you found in Step 2
+    res.json({ price: null, note: 'selector not filled in yet' });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
